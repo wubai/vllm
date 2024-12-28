@@ -137,6 +137,11 @@ See [this page](#generative-models) for more information on how to use generativ
     - :code:`deepseek-ai/DeepSeek-V2`, :code:`deepseek-ai/DeepSeek-V2-Chat` etc.
     -
     - ✅︎
+  * - :code:`DeepseekV3ForCausalLM`
+    - DeepSeek-V3
+    - :code:`deepseek-ai/DeepSeek-V3-Base`, :code:`deepseek-ai/DeepSeek-V3` etc.
+    -
+    - ✅︎
   * - :code:`ExaoneForCausalLM`
     - EXAONE-3
     - :code:`LGAI-EXAONE/EXAONE-3.0-7.8B-Instruct`, etc.
@@ -319,7 +324,7 @@ See [this page](#generative-models) for more information on how to use generativ
     - ✅︎
   * - :code:`Qwen2ForCausalLM`
     - Qwen2
-    - :code:`Qwen/Qwen2-7B-Instruct`, :code:`Qwen/Qwen2-7B`, etc.
+    - :code:`Qwen/QwQ-32B-Preview`, :code:`Qwen/Qwen2-7B-Instruct`, :code:`Qwen/Qwen2-7B`, etc.
     - ✅︎
     - ✅︎
   * - :code:`Qwen2MoeForCausalLM`
@@ -430,7 +435,7 @@ despite being described otherwise on its model card.
 ```
 
 If your model is not in the above list, we will try to automatically convert the model using
-:func:`vllm.model_executor.models.adapters.as_embedding_model`. By default, the embeddings
+{func}`vllm.model_executor.models.adapters.as_embedding_model`. By default, the embeddings
 of the whole prompt are extracted from the normalized hidden state corresponding to the last token.
 
 #### Reward Modeling (`--task reward`)
@@ -445,6 +450,11 @@ of the whole prompt are extracted from the normalized hidden state corresponding
     - Example HF Models
     - :ref:`LoRA <lora-adapter>`
     - :ref:`PP <distributed-serving>`
+  * - :code:`InternLM2ForRewardModel`
+    - InternLM2-based
+    - :code:`internlm/internlm2-1_8b-reward`, :code:`internlm/internlm2-7b-reward`, etc.
+    - ✅︎
+    - ✅︎
   * - :code:`LlamaForCausalLM`
     - Llama-based
     - :code:`peiyi9979/math-shepherd-mistral-7b-prm`, etc.
@@ -458,7 +468,7 @@ of the whole prompt are extracted from the normalized hidden state corresponding
 ```
 
 If your model is not in the above list, we will try to automatically convert the model using
-:func:`vllm.model_executor.models.adapters.as_reward_model`. By default, we return the hidden states of each token directly.
+{func}`vllm.model_executor.models.adapters.as_reward_model`. By default, we return the hidden states of each token directly.
 
 ```{important}
 For process-supervised reward models such as {code}`peiyi9979/math-shepherd-mistral-7b-prm`, the pooling config should be set explicitly,
@@ -490,7 +500,7 @@ e.g.: {code}`--override-pooler-config '{"pooling_type": "STEP", "step_tag_id": 1
 ```
 
 If your model is not in the above list, we will try to automatically convert the model using
-:func:`vllm.model_executor.models.adapters.as_classification_model`. By default, the class probabilities are extracted from the softmaxed hidden state corresponding to the last token.
+{func}`vllm.model_executor.models.adapters.as_classification_model`. By default, the class probabilities are extracted from the softmaxed hidden state corresponding to the last token.
 
 #### Sentence Pair Scoring (`--task score`)
 
@@ -676,7 +686,7 @@ See [this page](#generative-models) for more information on how to use generativ
     - PaliGemma, PaliGemma 2
     - T + I\ :sup:`E`
     - :code:`google/paligemma-3b-pt-224`, :code:`google/paligemma-3b-mix-224`, :code:`google/paligemma2-3b-ft-docci-448`, etc.
-    - 
+    -
     - ✅︎
     -
   * - :code:`Phi3VForCausalLM`
@@ -710,7 +720,7 @@ See [this page](#generative-models) for more information on how to use generativ
   * - :code:`Qwen2VLForConditionalGeneration`
     - Qwen2-VL
     - T + I\ :sup:`E+` + V\ :sup:`E+`
-    - :code:`Qwen/Qwen2-VL-2B-Instruct`, :code:`Qwen/Qwen2-VL-7B-Instruct`, :code:`Qwen/Qwen2-VL-72B-Instruct`, etc.
+    - :code:`Qwen/QVQ-72B-Preview`, :code:`Qwen/Qwen2-VL-7B-Instruct`, :code:`Qwen/Qwen2-VL-72B-Instruct`, etc.
     - ✅︎
     - ✅︎
     -
@@ -750,13 +760,12 @@ vLLM currently only supports adding LoRA to the language backbone of multimodal 
 ```
 
 ```{note}
-To use {code}`TIGER-Lab/Mantis-8B-siglip-llama3`, you have to install their GitHub repo ({code}`pip install git+https://github.com/TIGER-AI-Lab/Mantis.git`)
-and pass {code}`--hf_overrides '{"architectures": ["MantisForConditionalGeneration"]}'` when running vLLM.
+To use {code}`TIGER-Lab/Mantis-8B-siglip-llama3`, you have pass {code}`--hf_overrides '{"architectures": ["MantisForConditionalGeneration"]}'` when running vLLM.
 ```
 
 ```{note}
 The official {code}`openbmb/MiniCPM-V-2` doesn't work yet, so we need to use a fork ({code}`HwwwH/MiniCPM-V-2`) for now.
-For more details, please see: <https://github.com/vllm-project/vllm/pull/4087#issuecomment-2250397630>
+For more details, please see: <gh-pr:4087#issuecomment-2250397630>
 ```
 
 ### Pooling Models
@@ -834,5 +843,5 @@ We have the following levels of testing for models:
 
 1. **Strict Consistency**: We compare the output of the model with the output of the model in the HuggingFace Transformers library under greedy decoding. This is the most stringent test. Please refer to [models tests](https://github.com/vllm-project/vllm/blob/main/tests/models) for the models that have passed this test.
 2. **Output Sensibility**: We check if the output of the model is sensible and coherent, by measuring the perplexity of the output and checking for any obvious errors. This is a less stringent test.
-3. **Runtime Functionality**: We check if the model can be loaded and run without errors. This is the least stringent test. Please refer to [functionality tests](https://github.com/vllm-project/vllm/tree/main/tests) and [examples](https://github.com/vllm-project/vllm/tree/main/examples) for the models that have passed this test.
+3. **Runtime Functionality**: We check if the model can be loaded and run without errors. This is the least stringent test. Please refer to [functionality tests](gh-dir:tests) and [examples](gh-dir:main/examples) for the models that have passed this test.
 4. **Community Feedback**: We rely on the community to provide feedback on the models. If a model is broken or not working as expected, we encourage users to raise issues to report it or open pull requests to fix it. The rest of the models fall under this category.
