@@ -23,7 +23,6 @@ from transformers import (BatchFeature, CLIPVisionConfig, PretrainedConfig,
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
-from vllm.inputs import InputContext
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
@@ -32,12 +31,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.models.clip import CLIPVisionModel
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalDataItems,
-                                    MultiModalFieldConfig, MultiModalInputsV2,
-                                    MultiModalKwargs, NestedTensors,
-                                    PlaceholderRange)
+from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
+                                    MultiModalInputsV2, MultiModalKwargs,
+                                    NestedTensors, PlaceholderRange)
+from vllm.multimodal.parse import ImageEmbeddingItems, ImageProcessorItems
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        ProcessorInputs, PromptReplacement,
+                                        MultiModalDataItems, ProcessorInputs,
+                                        PromptReplacement,
                                         _BoundPromptReplacement,
                                         _PlaceholderInfo)
 from vllm.sequence import IntermediateTensors
@@ -305,24 +305,31 @@ class Phi3HDImageEmbedding(Phi3ImageEmbeddingBase):
         return image_features_hd_newline
 
 
-def get_max_phi3v_image_tokens(
-    ctx: InputContext,
-    *,
-    num_crops: Optional[int] = None,
-) -> int:
-    hf_processor_mm_kwargs = {}
-    if num_crops:
-        hf_processor_mm_kwargs["num_crops"] = num_crops
-
-    processor = ctx.get_hf_processor(**hf_processor_mm_kwargs)
-
-    return processor.calc_num_image_tokens_from_image_size(
-        width=MAX_IMAGE_FEATURE_SIZE_WIDTH,
-        height=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
-    )
-
-
 class Phi3VMultiModalProcessor(BaseMultiModalProcessor):
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"image": None}
+
+    def _get_num_image_tokens(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> int:
+        processor = self._get_hf_processor()
+
+        return processor.calc_num_image_tokens_from_image_size(  # type: ignore
+            width=image_width,
+            height=image_height,
+        )
+
+    def get_mm_max_tokens_per_item(self, seq_len: int) -> Mapping[str, int]:
+        max_image_tokens = self._get_num_image_tokens(
+            image_width=MAX_IMAGE_FEATURE_SIZE_WIDTH,
+            image_height=MAX_IMAGE_FEATURE_SIZE_HEIGHT,
+        )
+
+        return {"image": max_image_tokens}
 
     def _get_hf_processor(
         self,
@@ -331,6 +338,7 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor):
     ) -> ProcessorMixin:
         if num_crops is not None:
             return self.ctx.get_hf_processor(num_crops=num_crops)
+
         return self.ctx.get_hf_processor()
 
     def _call_hf_processor(
@@ -374,38 +382,45 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor):
     ) -> list[PromptReplacement]:
         hf_processor = self._get_hf_processor()
         image_tokens: list[str] = hf_processor.img_tokens  # type: ignore
-        image_processor = hf_processor.image_processor  # type: ignore
 
         tokenizer = self._get_tokenizer()
         bos_token_id = tokenizer.bos_token_id
         assert isinstance(bos_token_id, int)
 
         def get_replacement_phi3v(item_idx: int):
-            image_size = mm_items.get_image_size(item_idx)
-            num_tokens = image_processor.calc_num_image_tokens_from_image_size(
-                width=image_size.width,
-                height=image_size.height,
-            )
+            images = mm_items.get_items(
+                "image", (ImageEmbeddingItems, ImageProcessorItems))
 
-            return [_IMAGE_TOKEN_ID] * num_tokens + [bos_token_id]
+            if isinstance(images, ImageEmbeddingItems):
+                num_image_tokens = images.get_feature_size(item_idx)
+            else:
+                image_size = images.get_image_size(item_idx)
+                num_image_tokens = self._get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                )
+
+            return [_IMAGE_TOKEN_ID] * num_image_tokens + [bos_token_id]
+
+        num_images = mm_items.get_count("image", strict=False)
 
         return [
             PromptReplacement(
                 modality="image",
                 target=image_token,
                 replacement=get_replacement_phi3v,
-            ) for image_token in image_tokens[:len(mm_items.images)]
+            ) for image_token in image_tokens[:num_images]
         ]
 
     def _apply_prompt_replacements(
         self,
         token_ids: list[int],
-        prompt_repls: Sequence[_BoundPromptReplacement],
+        mm_prompt_repls: Mapping[str, Sequence[_BoundPromptReplacement]],
         mm_item_counts: Mapping[str, int],
-    ) -> tuple[list[int], str, list[_PlaceholderInfo]]:
+    ) -> tuple[list[int], str, Mapping[str, list[_PlaceholderInfo]]]:
         token_ids, text, placeholders = super()._apply_prompt_replacements(
             token_ids=token_ids,
-            prompt_repls=prompt_repls,
+            mm_prompt_repls=mm_prompt_repls,
             mm_item_counts=mm_item_counts,
         )
 
@@ -413,15 +428,23 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor):
         if text.startswith("<s> <|image|>"):
             text = text.replace("<s> <|image|>", "<s><|image|>", 1)
             token_ids = [token_ids[0], *token_ids[2:]]
-            placeholders = [
-                _PlaceholderInfo(p.modality, p.start_idx - 1, p.replacement)
-                for p in placeholders
-            ]
+            placeholders = {
+                modality: [
+                    _PlaceholderInfo(
+                        modality=p.modality,
+                        item_idx=p.item_idx,
+                        start_idx=p.start_idx - 1,
+                        replacement=p.replacement,
+                    ) for p in ps
+                ]
+                for modality, ps in placeholders.items()
+            }
 
         return token_ids, text, placeholders
 
-    def _get_dummy_mm_inputs(
+    def _get_dummy_processor_inputs(
         self,
+        seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> ProcessorInputs:
         num_images = mm_counts.get("image", 0)
@@ -462,7 +485,6 @@ class Phi3VMultiModalProcessor(BaseMultiModalProcessor):
         return result
 
 
-@MULTIMODAL_REGISTRY.register_max_image_tokens(get_max_phi3v_image_tokens)
 @MULTIMODAL_REGISTRY.register_processor(Phi3VMultiModalProcessor)
 class Phi3VForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     hf_to_vllm_mapper = WeightsMapper(

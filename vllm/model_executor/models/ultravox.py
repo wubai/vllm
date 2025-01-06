@@ -2,11 +2,10 @@
 """PyTorch Ultravox model."""
 
 import math
-from functools import cached_property, lru_cache
-from typing import (Any, Iterable, List, Literal, Mapping, Optional, Set,
-                    Tuple, TypedDict, Union)
+from functools import cached_property
+from typing import (Iterable, List, Literal, Mapping, Optional, Set, Tuple,
+                    TypedDict, Union)
 
-import numpy as np
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -17,20 +16,20 @@ from transformers.models.whisper.modeling_whisper import WhisperEncoder
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
-from vllm.inputs import InputContext
 from vllm.model_executor.layers.activation import SiluAndMul, get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.model_loader.loader import DefaultModelLoader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.multimodal.inputs import (MultiModalDataItems, MultiModalFieldConfig,
-                                    MultiModalKwargs, NestedTensors)
+from vllm.multimodal.inputs import (MultiModalFieldConfig, MultiModalKwargs,
+                                    NestedTensors)
+from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        ProcessorInputs, PromptReplacement)
+                                        MultiModalDataItems, ProcessorInputs,
+                                        PromptReplacement)
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.ultravox import UltravoxConfig
-from vllm.utils import is_list_of
 
 from .interfaces import SupportsMultiModal, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
@@ -56,22 +55,17 @@ UltravoxAudioInputs = Union[UltravoxAudioFeatureInputs,
                             UltravoxAudioEmbeddingInputs]
 
 
-@lru_cache
-def cached_feature_extractor(model_id: str) -> WhisperFeatureExtractor:
-    return WhisperFeatureExtractor.from_pretrained(model_id)
-
-
-def whisper_feature_extractor(ctx: InputContext) -> WhisperFeatureExtractor:
-    hf_config = ctx.get_hf_config(UltravoxConfig)
-    return cached_feature_extractor(hf_config.audio_model_id)
-
-
-def get_ultravox_max_audio_tokens(ctx: InputContext):
-    feature_extractor = whisper_feature_extractor(ctx)
-    return math.ceil(feature_extractor.chunk_length * _AUDIO_TOKENS_PER_SECOND)
-
-
 class UltravoxMultiModalProcessor(BaseMultiModalProcessor):
+
+    def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
+        return {"audio": None}
+
+    def get_mm_max_tokens_per_item(self, seq_len: int) -> Mapping[str, int]:
+        feature_extractor = self._get_feature_extractor()
+        max_audio_tokens = math.ceil(feature_extractor.chunk_length *
+                                     _AUDIO_TOKENS_PER_SECOND)
+
+        return {"audio": max_audio_tokens}
 
     def _get_hf_processor(
         self,
@@ -85,15 +79,9 @@ class UltravoxMultiModalProcessor(BaseMultiModalProcessor):
         hf_processor = self._get_hf_processor()
         return hf_processor.audio_processor.feature_extractor  # type: ignore
 
-    def _get_hf_mm_data(
-        self,
-        mm_items: MultiModalDataItems,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        # resample audio to the model's sampling rate
+    def _get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self._get_feature_extractor()
-        mm_items.resample_audios(feature_extractor.sampling_rate)
-
-        return super()._get_hf_mm_data(mm_items)
+        return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
 
     def _call_hf_processor(
         self,
@@ -113,6 +101,7 @@ class UltravoxMultiModalProcessor(BaseMultiModalProcessor):
 
         mm_data = dict(mm_data)
         audios = mm_data.pop("audios", [])
+        assert isinstance(audios, list)
 
         if not audios:
             return super()._call_hf_processor(
@@ -126,9 +115,6 @@ class UltravoxMultiModalProcessor(BaseMultiModalProcessor):
             **mm_kwargs,
             sampling_rate=feature_extractor.sampling_rate,
         )
-
-        # Already resampled by _get_hf_mm_data
-        assert is_list_of(audios, np.ndarray)
 
         # Ultravox processor doesn't support multiple inputs,
         # therefore we need to input text and audio one by one
@@ -187,21 +173,25 @@ class UltravoxMultiModalProcessor(BaseMultiModalProcessor):
             )
         ]
 
-    def _get_dummy_mm_inputs(
+    def _get_dummy_processor_inputs(
         self,
+        seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> ProcessorInputs:
         feature_extractor = self._get_feature_extractor()
+
         sampling_rate = feature_extractor.sampling_rate
         audio_len = feature_extractor.chunk_length * sampling_rate
+        num_audios = mm_counts.get("audio", 0)
 
-        audio_count = mm_counts.get("audio", 0)
-        audio = np.zeros(audio_len)
-        data = {"audio": [audio] * audio_count}
+        mm_data = {
+            "audio":
+            self._get_dummy_audios(length=audio_len, num_audios=num_audios)
+        }
 
         return ProcessorInputs(
-            prompt_text="<|audio|>" * audio_count,
-            mm_data=data,
+            prompt_text="<|audio|>" * num_audios,
+            mm_data=mm_data,
         )
 
 
@@ -323,8 +313,6 @@ class ModifiedWhisperEncoder(WhisperEncoder):
         return hidden_states
 
 
-@MULTIMODAL_REGISTRY.register_max_multimodal_tokens(
-    "audio", get_ultravox_max_audio_tokens)
 @MULTIMODAL_REGISTRY.register_processor(UltravoxMultiModalProcessor)
 class UltravoxModel(nn.Module, SupportsMultiModal, SupportsPP):
 

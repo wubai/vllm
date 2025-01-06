@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import AsyncGenerator, Dict, List, Mapping, Optional, Type, Union
 
 from vllm.config import ModelConfig, VllmConfig
@@ -16,10 +17,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
+from vllm.utils import kill_process_tree
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.detokenizer import Detokenizer
 from vllm.v1.engine.processor import Processor
 from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.ray_utils import initialize_ray_cluster
 
 logger = init_logger(__name__)
 
@@ -38,6 +41,7 @@ class AsyncLLM(EngineClient):
         log_requests: bool = True,
         start_engine_loop: bool = True,
     ) -> None:
+
         assert start_engine_loop
 
         self.log_requests = log_requests
@@ -84,9 +88,6 @@ class AsyncLLM(EngineClient):
 
         self.output_handler: Optional[asyncio.Task] = None
 
-    def __del__(self):
-        self.shutdown()
-
     @classmethod
     def from_engine_args(
         cls,
@@ -131,7 +132,11 @@ class AsyncLLM(EngineClient):
         executor_class: Type[Executor]
         distributed_executor_backend = (
             vllm_config.parallel_config.distributed_executor_backend)
-        if distributed_executor_backend == "mp":
+        if distributed_executor_backend == "ray":
+            initialize_ray_cluster(vllm_config.parallel_config)
+            from vllm.v1.executor.ray_executor import RayExecutor
+            executor_class = RayExecutor
+        elif distributed_executor_backend == "mp":
             from vllm.v1.executor.multiproc_executor import MultiprocExecutor
             executor_class = MultiprocExecutor
         else:
@@ -158,16 +163,18 @@ class AsyncLLM(EngineClient):
             raise ValueError(f"Request id {request_id} already running.")
         self.rid_to_queue[request_id] = asyncio.Queue()
 
-        # 2) Convert input --> DetokenizerRequest / EngineCoreRequest.
-        detokenizer_req, engine_core_req = self.processor.process_inputs(
-            request_id, prompt, params, arrival_time, lora_request,
-            trace_headers, prompt_adapter_request, priority)
+        # 2) Convert Input --> Request.
+        request = self.processor.process_inputs(request_id, prompt, params,
+                                                arrival_time, lora_request,
+                                                trace_headers,
+                                                prompt_adapter_request,
+                                                priority)
 
         # 3) Add the request to Detokenizer (this process).
-        self.detokenizer.add_request(detokenizer_req)
+        self.detokenizer.add_request(request)
 
         # 4) Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(engine_core_req)
+        await self.engine_core.add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request_id)
@@ -274,9 +281,9 @@ class AsyncLLM(EngineClient):
                 # 4) Abort any requests that finished due to stop strings.
                 await self.engine_core.abort_requests_async(reqs_to_abort)
 
-        except BaseException as e:
-            logger.error(e)
-            raise e
+        except Exception as e:
+            logger.exception("EngineCore output handler hit an error: %s", e)
+            kill_process_tree(os.getpid())
 
     async def abort(self, request_id: str) -> None:
         """Abort RequestId in self, detokenizer, and engine core."""
